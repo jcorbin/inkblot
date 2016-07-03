@@ -67,9 +67,12 @@ global = this;
 
 module.exports = Document;
 
-function Document(element) {
+function Document(element, redraw) {
     var self = this;
-    this.element = element;
+    this.document = element.ownerDocument;
+    this.parent = element;
+    this.container = null;
+    this.element = null;
     this.engine = null;
     this.carry = '';
     this.cursor = null;
@@ -78,6 +81,7 @@ function Document(element) {
     this.p = false;
     this.br = false;
     this.onclick = onclick;
+    this.redraw = redraw;
     function onclick(event) {
         self.answer(event.target.number);
     }
@@ -123,27 +127,64 @@ Document.prototype.option = function option(number, label) {
 };
 
 Document.prototype.flush = function flush() {
+    if (this.redraw) {
+        this.redraw();
+    }
     // No-op (for console only)
 };
 
 Document.prototype.pardon = function pardon() {
-    this.clear();
-    // No-op (for console only)
+    this.options.innerHTML = '';
 };
 
 Document.prototype.display = function display() {
-    // No-op (for console only)
+    if (this.redraw) {
+        this.redraw();
+    }
+    this.container.style.opacity = 0;
+    this.container.style.transform = 'translateX(2ex)';
+    this.parent.appendChild(this.container);
+
+    // TODO not this
+    var container = this.container;
+    setTimeout(function () {
+        container.style.opacity = 1;
+        container.style.transform = 'translateX(0)';
+    }, 10);
 };
 
 Document.prototype.clear = function clear() {
-    var document = this.element.ownerDocument;
-    this.element.innerHTML = "";
-    this.options = document.createElement("table");
+    if (this.container) {
+        this.container.style.opacity = 0;
+        this.container.style.transform = 'translateX(-2ex)';
+        this.container.addEventListener("transitionend", this);
+    }
+
+    this.container = this.document.createElement("div");
+    this.container.classList.add("parent");
+    this.container.style.opacity = 0;
+    var child = this.document.createElement("div");
+    child.classList.add("child");
+    this.container.appendChild(child);
+    var outer = this.document.createElement("outer");
+    outer.classList.add("outer");
+    child.appendChild(outer);
+    this.element = this.document.createElement("inner");
+    this.element.classList.add("inner");
+    outer.appendChild(this.element);
+    this.options = this.document.createElement("table");
     this.element.appendChild(this.options);
+
     this.cursor = null;
     this.br = false;
     this.p = true;
     this.carry = '';
+};
+
+Document.prototype.handleEvent = function handleEvent(event) {
+    if (event.target.parentNode === this.parent) {
+        this.parent.removeChild(event.target);
+    }
 };
 
 Document.prototype.question = function question() {
@@ -156,7 +197,7 @@ Document.prototype.answer = function answer(text) {
 Document.prototype.close = function close() {
 };
 
-}],["engine.js","inkblot","engine.js",{"./story":6,"./evaluate":2},function (require, exports, module, __filename, __dirname){
+}],["engine.js","inkblot","engine.js",{"./story":7,"./evaluate":2},function (require, exports, module, __filename, __dirname){
 
 // inkblot/engine.js
 // -----------------
@@ -170,26 +211,35 @@ module.exports = Engine;
 
 var debug = typeof process === 'object' && process.env.DEBUG_ENGINE;
 
-function Engine(story, start, render, interlocutor, randomer) {
+function Engine(args) {
     // istanbul ignore next
-    start = start || 'start';
     var self = this;
-    this.story = story;
+    this.story = args.story;
     this.options = [];
     this.keywords = {};
-    this.variables = {};
-    this.global = new Global(randomer);
-    this.top = this.global;
+    this.storage = args.storage || new Global();
+    this.top = this.storage;
     this.stack = [this.top];
     this.label = '';
+    // istanbul ignore next
+    var start = args.start || this.storage.get('@') || 'start';
     this.instruction = new Story.constructors.goto(start);
-    this.render = render;
-    this.interlocutor = interlocutor;
-    this.interlocutor.engine = this;
-    this.randomer = randomer;
+    this.render = args.render;
+    this.dialog = args.dialog;
+    this.dialog.engine = this;
+    // istanbul ignore next
+    this.randomer = args.randomer || Math;
     this.debug = debug;
+    this.end = this.end;
     Object.seal(this);
 }
+
+Engine.prototype.end = function end() {
+    this.display();
+    this.render.break();
+    this.dialog.close();
+    return false;
+};
 
 Engine.prototype.continue = function _continue() {
     var _continue;
@@ -216,7 +266,7 @@ Engine.prototype.$text = function text() {
 };
 
 Engine.prototype.$print = function print() {
-    return this.print('' + evaluate(this.top, this.instruction.expression));
+    return this.print('' + evaluate(this.top, this.randomer, this.instruction.expression));
 };
 
 Engine.prototype.$break = function $break() {
@@ -259,13 +309,13 @@ Engine.prototype.$call = function $call() {
     if (!routine) {
         throw new Error('no such routine ' + this.instruction.label);
     }
-    // TODO replace this.global with closure scope if scoped procedures become
+    // TODO replace this.storage with closure scope if scoped procedures become
     // viable. This will require that the engine create references to closures
     // when entering a new scope (calling a procedure), in addition to
     // capturing locals. As such the parser will need to retain a reference to
     // the enclosing procedure and note all of the child procedures as they are
     // encountered.
-    this.top = new Frame(this.global, routine.locals || [], this.instruction.next, this.instruction.branch);
+    this.top = new Frame(this.storage, routine.locals || [], this.instruction.next, this.label);
     this.stack.push(this.top);
     return this.goto(this.instruction.branch);
 };
@@ -286,7 +336,7 @@ Engine.prototype.$option = function option() {
 };
 
 Engine.prototype.$set = function set() {
-    var value = evaluate(this.top, this.instruction.expression);
+    var value = evaluate(this.top, this.randomer, this.instruction.expression);
     // istanbul ignore if
     if (this.debug) {
         console.log(this.top.at() + '/' + this.label + ' ' + this.instruction.variable + ' = ' + value);
@@ -295,9 +345,20 @@ Engine.prototype.$set = function set() {
     return this.goto(this.instruction.next);
 };
 
+Engine.prototype.$mov = function mov() {
+    var value = evaluate(this.top, this.randomer, this.instruction.source);
+    var name = evaluate.nominate(this.top, this.randomer, this.instruction.target);
+    // istanbul ignore if
+    if (this.debug) {
+        console.log(this.top.at() + '/' + this.label + ' ' + name + ' = ' + value);
+    }
+    this.top.set(name, value);
+    return this.goto(this.instruction.next);
+};
+
 Engine.prototype.$jump = function jump() {
     var j = this.instruction;
-    if (evaluate(this.top, j.condition)) {
+    if (evaluate(this.top, this.randomer, j.condition)) {
         return this.goto(this.instruction.branch);
     } else {
         return this.goto(this.instruction.next);
@@ -310,7 +371,7 @@ Engine.prototype.$switch = function _switch() {
     if (this.instruction.mode === 'rand') {
         value = Math.floor(this.randomer.random() * branches.length);
     } else {
-        value = evaluate(this.top, this.instruction.expression);
+        value = evaluate(this.top, this.randomer, this.instruction.expression);
         this.top.set(this.instruction.variable, value + this.instruction.value);
     }
     if (this.instruction.mode === 'loop') {
@@ -334,16 +395,13 @@ Engine.prototype.$prompt = function prompt() {
 };
 
 Engine.prototype.goto = function _goto(name) {
-    while (name === null && this.stack.length > 1 && this.options.length === 0) {
+    while (name === null && this.stack.length > 1) {
         var top = this.stack.pop();
         this.top = this.stack[this.stack.length - 1];
         name = top.next;
     }
     if (name == null) {
-        this.display();
-        this.render.break();
-        this.interlocutor.close();
-        return false;
+        return this.end();
     }
     var next = this.story[name];
     // istanbul ignore if
@@ -358,7 +416,7 @@ Engine.prototype.goto = function _goto(name) {
 Engine.prototype.answer = function answer(text) {
     this.render.flush();
     if (text === 'quit') {
-        this.interlocutor.close();
+        this.dialog.close();
         return;
     }
     // istanbul ignore next
@@ -371,14 +429,18 @@ Engine.prototype.answer = function answer(text) {
     var n = +text;
     if (n >= 1 && n <= this.options.length) {
         this.render.clear();
-        if (this.goto(this.options[n - 1].branch)) {
+        var at = this.options[n - 1].branch;
+        this.storage.set('@', at);
+        if (this.goto(at)) {
             this.flush();
             this.continue();
         }
     // istanbul ignore next
     } else if (this.keywords[text]) {
         this.render.clear();
-        if (this.goto(this.keywords[text])) {
+        var at = this.keywords[text];
+        this.storage.set('@', at);
+        if (this.goto(at)) {
             this.flush();
             this.continue();
         }
@@ -398,7 +460,7 @@ Engine.prototype.prompt = function prompt() {
         var option = this.options[i];
         this.render.option(i + 1, option.label);
     }
-    this.interlocutor.question();
+    this.dialog.question();
 };
 
 Engine.prototype.flush = function flush() {
@@ -406,9 +468,8 @@ Engine.prototype.flush = function flush() {
     this.keywords = {};
 };
 
-function Global(randomer) {
+function Global() {
     this.scope = Object.create(null);
-    this.randomer = randomer;
     this.next = null;
 }
 
@@ -420,19 +481,16 @@ Global.prototype.set = function set(name, value) {
     this.scope[name] = value;
 };
 
-Global.prototype.random = function random() {
-    return this.randomer.random();
-};
-
 // istanbul ignore next
 Global.prototype.log = function log() {
     var globals = Object.keys(this.scope);
+    globals.sort();
     for (var i = 0; i < globals.length; i++) {
         var name = globals[i];
         var value = this.scope[name];
         console.log(name + ' = ' + value);
     }
-    render.paragraph();
+    console.log('');
 };
 
 // istanbul ignore next
@@ -467,10 +525,6 @@ Frame.prototype.set = function set(name, value) {
     this.caller.set(name, value);
 };
 
-Frame.prototype.random = function random() {
-    return this.caller.random();
-};
-
 // istanbul ignore next
 Frame.prototype.log = function log() {
     console.log('--- ' + this.branch + ' -> ' + this.next);
@@ -495,25 +549,44 @@ Frame.prototype.at = function at() {
 
 module.exports = evaluate;
 
-function evaluate(scope, args) {
+function evaluate(scope, randomer, args) {
     var name = args[0];
     if (binary[name]) {
         return binary[name](
-            evaluate(scope, args[1]),
-            evaluate(scope, args[2]),
-            scope
+            evaluate(scope, randomer, args[1]),
+            evaluate(scope, randomer, args[2]),
+            scope,
+            randomer
         );
     // istanbul ignore next
     } else if (unary[name]) {
-        return unary[name](evaluate(scope, args[1]));
+        return unary[name](
+            evaluate(scope, randomer, args[1]),
+            scope,
+            randomer
+        );
     } else if (name === 'val') {
         return args[1];
-    // istanbul ignore else
     } else if (name === 'get') {
-        return scope.get(args[1]);
+        return +scope.get(args[1]);
+    // istanbul ignore else
+    } else if (name === 'var') {
+        return +scope.get(nominate(scope, randomer, args));
     }
     // istanbul ignore next
     throw new Error('Unexpected operator ' + args[0]);
+}
+
+evaluate.nominate = nominate;
+function nominate(scope, randomer, args) {
+    var literals = args[1];
+    var variables = args[2];
+    var name = '';
+    for (var i = 0; i < variables.length; i++) {
+        name += literals[i] + (+scope.get(variables[i]));
+    }
+    name += literals[i];
+    return name;
 }
 
 var binary = {
@@ -527,7 +600,7 @@ var binary = {
         return x * y;
     },
     '/': function (x, y) {
-        return (x / y) >>> 0;
+        return (x / y) >> 0;
     },
     '%': function (x, y) {
         return x % y;
@@ -559,10 +632,10 @@ var binary = {
     '#': function (x, y) {
         return hilbert(x, y);
     },
-    '~': function (x, y, scope) {
+    '~': function (x, y, scope, randomer) {
         var r = 0;
         for (var i = 0; i < x; i++) {
-            r += scope.random() * y;
+            r += randomer.random() * y;
         }
         return Math.floor(r);
     }
@@ -577,10 +650,10 @@ var unary = {
 
 evaluate.hash = hash;
 function hash(x) {
-    x = ((x >>> 16) ^ x) * 0x45d9f3b;
-    x = ((x >>> 16) ^ x) * 0x45d9f3b;
-    x = ((x >>> 16) ^ x);
-    return x >>> 0;
+    x = ((x >> 16) ^ x) * 0x45d9f3b;
+    x = ((x >> 16) ^ x) * 0x45d9f3b;
+    x = ((x >> 16) ^ x);
+    return x >> 0;
 }
 
 var msb = (-1 >>> 1) + 1;
@@ -704,6 +777,8 @@ module.exports = {
             "get",
             "arrow"
         ],
+        "lift": "",
+        "drop": "",
         "next": "shop.1.3.1"
     },
     "shop.1.3.1": {
@@ -1022,6 +1097,8 @@ module.exports = {
             "get",
             "arrow"
         ],
+        "lift": "",
+        "drop": "",
         "next": "range.1.3.1"
     },
     "range.1.3.1": {
@@ -1227,6 +1304,8 @@ module.exports = {
             "get",
             "gold"
         ],
+        "lift": "",
+        "drop": "",
         "next": "gold.1.3.1"
     },
     "gold.1.3.1": {
@@ -1285,6 +1364,8 @@ module.exports = {
             "get",
             "hit"
         ],
+        "lift": "",
+        "drop": "",
         "next": "exit.6"
     },
     "exit.6": {
@@ -1336,7 +1417,7 @@ module.exports = {
     }
 }
 
-}],["index.js","inkblot","index.js",{"./engine":1,"./examples/archery.json":3,"./document":0},function (require, exports, module, __filename, __dirname){
+}],["index.js","inkblot","index.js",{"./engine":1,"./examples/archery.json":3,"./story":7,"./document":0,"./localstorage":5},function (require, exports, module, __filename, __dirname){
 
 // inkblot/index.js
 // ----------------
@@ -1344,9 +1425,23 @@ module.exports = {
 'use strict';
 var Engine = require('./engine');
 var story = require('./examples/archery.json');
+var Story = require('./story');
 var Document = require('./document');
-var doc = new Document(document.getElementById('body'));
-var engine = new Engine(story, 'start', doc, doc);
+var LocalStorage = require('./localstorage');
+var doc = new Document(document.body);
+var engine = new Engine({
+    story: story,
+    render: doc,
+    dialog: doc,
+    storage: new LocalStorage(localStorage)
+});
+engine.end = function end() {
+    this.options.push({
+        'label': 'Once more from the top…',
+        'branch': 'start'
+    });
+    return this.$prompt();
+};
 doc.clear();
 engine.continue();
 
@@ -1356,6 +1451,32 @@ window.onkeypress = function onkeypress(event) {
     if (match) {
         engine.answer(match[1]);
     }
+};
+
+}],["localstorage.js","inkblot","localstorage.js",{},function (require, exports, module, __filename, __dirname){
+
+// inkblot/localstorage.js
+// -----------------------
+
+'use strict';
+
+module.exports = LocalStorage;
+
+function LocalStorage(storage, prefix) {
+    this.storage = storage;
+    this.prefix = prefix || '';
+}
+
+LocalStorage.prototype.get = function get(name) {
+    return this.storage.getItem(this.prefix + name);
+};
+
+LocalStorage.prototype.set = function set(name, value) {
+    return this.storage.setItem(this.prefix + name, value);
+};
+
+LocalStorage.prototype.clear = function clear() {
+    this.storage.clear();
 };
 
 }],["path.js","inkblot","path.js",{},function (require, exports, module, __filename, __dirname){
@@ -1404,7 +1525,7 @@ function zerothChildPath(path) {
     return path;
 }
 
-}],["story.js","inkblot","story.js",{"pop-equals":8,"./path":5},function (require, exports, module, __filename, __dirname){
+}],["story.js","inkblot","story.js",{"pop-equals":9,"./path":6},function (require, exports, module, __filename, __dirname){
 
 // inkblot/story.js
 // ----------------
@@ -1465,6 +1586,8 @@ constructors.print = Print;
 function Print(expression) {
     this.type = 'print';
     this.expression = expression;
+    this.lift = '';
+    this.drop = '';
     this.next = null;
     Object.seal(this);
 }
@@ -1476,6 +1599,8 @@ Print.prototype.describe = function describe() {
 Print.prototype.equals = function _equals(that) {
     return this.type === that.type &&
         equals(this.expression, that.expression) &&
+        this.lift === that.lift &&
+        this.drop === that.drop &&
         this.next === that.next;
 };
 
@@ -1528,7 +1653,7 @@ function Call(label) {
 Call.prototype.tie = tie;
 // istanbul ignore next
 Call.prototype.describe = function describe() {
-    return this.branch + '() -> ' + this.next;
+    return this.label + ' ' + this.branch + '() -> ' + this.next;
 };
 Call.prototype.equals = function equals(that) {
     return this.type === that.type &&
@@ -1620,6 +1745,26 @@ Set.prototype.equals = function equals(that) {
     return this.type === that.type &&
         this.variable === that.variable &&
         this.parameter === Boolean(that.parameter) &&
+        this.next === that.next;
+};
+
+constructors.mov = Mov;
+function Mov(variable) {
+    this.type = 'mov';
+    this.source = null;
+    this.target = null;
+    this.next = null;
+    Object.seal(this);
+}
+Mov.prototype.tie = tie;
+// istanbul ignore next
+Mov.prototype.describe = function describe() {
+    return S(this.source) + ' -> ' + S(this.expression);
+};
+Mov.prototype.equals = function _equals(that) {
+    return this.type === that.type &&
+        equals(this.source, that.source) &&
+        equals(this.target, that.target) &&
         this.next === that.next;
 };
 
@@ -1793,7 +1938,7 @@ MiniMap.prototype.clear = function () {
 };
 
 
-}],["pop-equals.js","pop-equals","pop-equals.js",{"mini-map":7},function (require, exports, module, __filename, __dirname){
+}],["pop-equals.js","pop-equals","pop-equals.js",{"mini-map":8},function (require, exports, module, __filename, __dirname){
 
 // pop-equals/pop-equals.js
 // ------------------------
